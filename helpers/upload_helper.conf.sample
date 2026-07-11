@@ -1,0 +1,30 @@
+# upload_helper.conf.sample
+#
+# upload_helper.sh の既定値を上書きするための設定ファイルのサンプル。
+# 使い方:
+#   1) 本ファイルを upload_helper.conf 等にコピーして値を編集する。
+#   2) 実行時に --config /path/to/upload_helper.conf を渡す。
+#      もしくは環境変数 UPLOAD_HELPER_CONFIG=/path/to/upload_helper.conf を設定する。
+#
+# 注意（セキュリティ）:
+#   本ファイルは upload_helper.sh から source されます。任意のシェルコードが
+#   実行され得るため、信頼できる場所・権限（他者書き込み不可）に置いてください。
+#   認証情報（アクセスキー等）はここに書かないでください。
+
+DEFAULT_ACCOUNT_ID="123456789012"
+DEFAULT_PROFILE="development"
+DEFAULT_REGION="ap-northeast-1"
+DEFAULT_BUCKET="example-bucket"
+DEFAULT_PREFIX="incoming"
+
+DEFAULT_SWITCHBACK_MODE="auto"
+DEFAULT_SWITCHBACK_SCRIPT="/opt/company/aws/switchback.sh"
+DEFAULT_SWITCHBACK_ARGS=("arn:aws:iam::123456789012:role/UploadRole")
+
+DEFAULT_LOG_LEVEL="INFO"
+DEFAULT_RESULT_FORMAT="csv"
+
+# 毎回必ず指定させたい項目は、既定値を空にして REQUIRED_VARS に列挙する。
+# 例: バケットを毎回指定させたい場合
+# DEFAULT_BUCKET=""
+# REQUIRED_VARS=("ACCOUNT_ID" "BUCKET")
