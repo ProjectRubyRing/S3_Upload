@@ -988,17 +988,17 @@ build_plan_dir_recursive() {
 #   同一実行内の衝突と、既存オブジェクトの上書きの両方を確認する。
 check_s3key_collision() {
   local s3uri="$1" src="$2"
-  local -n _seen="$3"
+  local -n _ck_seen="$3"
 
   # 同一実行内の衝突
-  if [[ -n "${_seen[$s3uri]:-}" ]]; then
+  if [[ -n "${_ck_seen[$s3uri]:-}" ]]; then
     if [[ "$ALLOW_OVERWRITE" == true ]]; then
       log_warn "同一 S3 キーが実行内で重複していますが上書き許可のため続行します: ${s3uri} (元: ${src})"
     else
       die "$EXIT_USAGE" "同一 S3 キーが実行内で衝突しています: ${s3uri}（元: ${src}）。--allow-overwrite を検討してください。"
     fi
   fi
-  _seen[$s3uri]=1
+  _ck_seen[$s3uri]=1
 
   # 既存オブジェクトの上書き検出（dry-run でも読み取りは可）
   if [[ "$ALLOW_OVERWRITE" != true ]]; then
