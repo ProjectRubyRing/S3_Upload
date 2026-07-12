@@ -62,6 +62,7 @@ BUCKET=""
 SELECT_BUCKET=false
 DEST_ROOT=false
 DEST_PREFIX=""
+BACKUP_DIR=""           # 既存ファイルのバックアップ ZIP 出力先ディレクトリ
 declare -a FILES=()
 declare -a DIRECTORIES=()
 ZIP_DIRECTORIES=false
@@ -94,6 +95,12 @@ COUNT_PLANNED=0
 COUNT_SUCCESS=0
 COUNT_FAILED=0
 COUNT_SKIPPED=0
+
+# 進捗表示用
+PROGRESS_TOTAL=0
+PROGRESS_DONE=0
+PROGRESS_LABEL=""
+__PROGRESS_LAST_PCT=-1
 
 # ==============================================================================
 # common.sh 読み込み
@@ -181,6 +188,36 @@ define_s3_common() {
   log_warn()  { log WARN  "$@"; }
   log_info()  { log INFO  "$@"; }
   log_debug() { log DEBUG "$@"; }
+
+  # ---- 進捗表示（処理中であることが分かるよう進捗率を出す）----
+  #   端末(stderr が tty)なら同一行を \r で更新、非端末なら整数%が変わるたびに1行出力。
+  progress_init() {
+    PROGRESS_TOTAL="${1:-0}"
+    PROGRESS_LABEL="${2:-処理中}"
+    PROGRESS_DONE=0
+    __PROGRESS_LAST_PCT=-1
+    progress_render
+  }
+  progress_tick() {
+    PROGRESS_DONE=$(( PROGRESS_DONE + ${1:-1} ))
+    progress_render
+  }
+  progress_render() {
+    local total="$PROGRESS_TOTAL" done="$PROGRESS_DONE" pct=100
+    (( total > 0 )) && pct=$(( done * 100 / total ))
+    (( pct > 100 )) && pct=100
+    if [[ -t 2 ]]; then
+      printf '\r%s: %d/%d (%d%%)   ' "$PROGRESS_LABEL" "$done" "$total" "$pct" >&2
+    elif [[ "$pct" != "$__PROGRESS_LAST_PCT" ]]; then
+      __log_enabled INFO && printf '%s [INFO] %s: %d/%d (%d%%)\n' "$(__log_now)" "$PROGRESS_LABEL" "$done" "$total" "$pct" >&2
+      __PROGRESS_LAST_PCT="$pct"
+    fi
+  }
+  progress_end() {
+    progress_render
+    [[ -t 2 ]] && printf '\n' >&2
+    return 0
+  }
 
   # ---- 異常終了処理: die EXIT_CODE "メッセージ" ----
   die() { local code="$1"; shift; log_error "$*"; exit "$code"; }
@@ -415,6 +452,12 @@ AWS/認証:
   --destination-root          バケットルート直下へ
   --destination-prefix PREFIX S3 キーのプレフィックス配下へ
 
+バックアップ:
+  --backup-dir DIRECTORY_PATH アップロード先に既存ファイルがある場合、事前に
+                              その S3 ディレクトリ配下のファイル群を ZIP に固め、
+                              処理日時(YYYYMMDD_HHMMSS)付きのバックアップ ZIP を
+                              指定ディレクトリへ出力する
+
 アップロード元（いずれか1つ以上必須。複数指定可）:
   --file FILE_PATH            アップロードするファイル
   --directory DIRECTORY_PATH アップロードするディレクトリ
@@ -462,6 +505,8 @@ parse_args() {
       --destination-root) DEST_ROOT=true; shift ;;
       --destination-prefix)   require_value_early "$1" "${2:-}"; DEST_PREFIX="$2"; shift 2 ;;
       --destination-prefix=*) DEST_PREFIX="${1#*=}"; shift ;;
+      --backup-dir)      require_value_early "$1" "${2:-}"; BACKUP_DIR="$2"; shift 2 ;;
+      --backup-dir=*)    BACKUP_DIR="${1#*=}"; shift ;;
       --file)            require_value_early "$1" "${2:-}"; FILES+=("$2"); shift 2 ;;
       --file=*)          FILES+=("${1#*=}"); shift ;;
       --directory)       require_value_early "$1" "${2:-}"; DIRECTORIES+=("$2"); shift 2 ;;
@@ -534,6 +579,13 @@ validate_args() {
   # プレフィックスに '..' を含めない（パストラバーサル対策）
   if [[ -n "$DEST_PREFIX" && "$DEST_PREFIX" == *".."* ]]; then
     die "$EXIT_USAGE" "プレフィックスに '..' を含めることはできません: ${DEST_PREFIX}"
+  fi
+
+  # バックアップ出力先ディレクトリ（指定時のみ検証）
+  if [[ -n "$BACKUP_DIR" ]]; then
+    [[ -e "$BACKUP_DIR" ]] || die "$EXIT_USAGE" "--backup-dir で指定したディレクトリが存在しません: ${BACKUP_DIR}"
+    [[ -d "$BACKUP_DIR" ]] || die "$EXIT_USAGE" "--backup-dir がディレクトリではありません: ${BACKUP_DIR}"
+    [[ -w "$BACKUP_DIR" ]] || die "$EXIT_USAGE" "--backup-dir に書き込み権限がありません: ${BACKUP_DIR}"
   fi
 
   # アップロード元必須
@@ -876,8 +928,35 @@ canonical_path() {
   realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"
 }
 
+# アップロード対象の概算件数を求める（進捗率の分母に使用）
+#   ファイルは1件、ディレクトリは ZIP 化なら1件、そうでなければ配下ファイル数。
+estimate_total_items() {
+  local total=0 f d c
+  for f in "${FILES[@]:-}"; do
+    [[ -n "$f" ]] && total=$((total+1))
+  done
+  for d in "${DIRECTORIES[@]:-}"; do
+    [[ -n "$d" ]] || continue
+    if [[ "$ZIP_DIRECTORIES" == true ]]; then
+      total=$((total+1))
+    else
+      c="$(find "$d" -type f 2>/dev/null | wc -l | tr -d '[:space:]')"
+      [[ "$c" =~ ^[0-9]+$ ]] || c=0
+      # 空ディレクトリでも SKIPPED レコードで1件進むため最低1件とみなす
+      (( c == 0 )) && c=1
+      total=$((total + c))
+    fi
+  done
+  printf '%s' "$total"
+}
+
 build_plan() {
   log_info "アップロード計画を作成しています。"
+
+  # 進捗率表示の準備（多数ファイル時に停止して見えないようにする）
+  local total_est
+  total_est="$(estimate_total_items)"
+  progress_init "$total_est" "アップロード計画を作成中"
 
   local -A seen_local=()   # 重複ローカルパス検出
   local -A seen_s3key=()   # S3 キー衝突検出
@@ -890,6 +969,7 @@ build_plan() {
     canon="$(canonical_path "$f")"
     if [[ -n "${seen_local[$canon]:-}" ]]; then
       log_warn "重複指定されたファイルをスキップします: ${f}"
+      progress_tick
       continue
     fi
     seen_local[$canon]=1
@@ -898,9 +978,10 @@ build_plan() {
     s3uri="$(build_s3_uri "$base")"
     size="$(stat -c '%s' -- "$f" 2>/dev/null || echo 0)"
 
-    check_s3key_collision "$s3uri" "$f" seen_s3key || continue
+    check_s3key_collision "$s3uri" "$f" seen_s3key || { progress_tick; continue; }
     add_plan_record "file" "$f" "no" "" "$s3uri" "$size" "PLANNED" ""
     COUNT_PLANNED=$((COUNT_PLANNED+1))
+    progress_tick
   done
 
   # ---- ディレクトリ ----
@@ -921,6 +1002,8 @@ build_plan() {
       build_plan_dir_recursive "$d" seen_s3key
     fi
   done
+
+  progress_end
 
   if [[ "$COUNT_PLANNED" -eq 0 ]]; then
     die "$EXIT_LOCAL_FILE" "アップロード対象が0件です。指定内容を確認してください。"
@@ -949,10 +1032,11 @@ build_plan_dir_zip() {
   fi
 
   s3uri="$(build_s3_uri "$zipname")"
-  check_s3key_collision "$s3uri" "$d" _seen || return 0
+  check_s3key_collision "$s3uri" "$d" _seen || { progress_tick; return 0; }
   # dry-run では ZIP を作らないためサイズは未知
   add_plan_record "dir-zip" "$d" "yes" "$zipname" "$s3uri" "-" "PLANNED" ""
   COUNT_PLANNED=$((COUNT_PLANNED+1))
+  progress_tick
 }
 
 # ディレクトリを階層維持で再帰アップロードする計画
@@ -972,15 +1056,17 @@ build_plan_dir_recursive() {
     base_rel="${dirname}/${rel}"
     s3uri="$(build_s3_uri "$base_rel")"
     size="$(stat -c '%s' -- "$file" 2>/dev/null || echo 0)"
-    check_s3key_collision "$s3uri" "$file" _seen || continue
+    check_s3key_collision "$s3uri" "$file" _seen || { progress_tick; continue; }
     add_plan_record "dir-file" "$file" "no" "" "$s3uri" "$size" "PLANNED" ""
     COUNT_PLANNED=$((COUNT_PLANNED+1))
+    progress_tick
   done < <(find "$d" -type f -print0 2>/dev/null)
 
   if [[ "$found" != true ]]; then
     log_warn "空ディレクトリのためアップロード対象がありません: ${d}"
     add_plan_record "dir-empty" "$d" "no" "" "-" "0" "SKIPPED" "空ディレクトリ"
     COUNT_SKIPPED=$((COUNT_SKIPPED+1))
+    progress_tick
   fi
 }
 
@@ -1027,6 +1113,7 @@ AWS リージョン     : ${AWS_REGION_OPT:-（既定）}
 宛先プレフィックス : ${DEST_PREFIX:-（ルート）}
 上書き許可         : ${ALLOW_OVERWRITE}
 ZIP 化             : ${ZIP_DIRECTORIES}
+バックアップ先     : ${BACKUP_DIR:-（なし）}
 計画件数           : ${COUNT_PLANNED}
 =================================================
 EOF
@@ -1062,6 +1149,86 @@ create_zip_for_dir() {
     return 0
   fi
   return 1
+}
+
+# ==============================================================================
+# 既存ファイルのバックアップ
+#   --backup-dir 指定時、アップロード先（宛先プレフィックス配下）に既存ファイルが
+#   ある場合、それらをダウンロードして ZIP に固め、処理日時(YYYYMMDD_HHMMSS)付きの
+#   バックアップ ZIP を指定ディレクトリへ出力する。
+# ==============================================================================
+backup_existing_s3_objects() {
+  # 未指定なら何もしない
+  [[ -n "$BACKUP_DIR" ]] || return 0
+
+  # 宛先プレフィックス（S3「ディレクトリ」）。ルート宛先の場合はバケット全体が対象。
+  local s3prefix=""
+  [[ -n "$DEST_PREFIX" ]] && s3prefix="${DEST_PREFIX}/"
+  local s3loc="s3://${BUCKET}/${s3prefix}"
+
+  log_info "アップロード先の既存ファイルの有無を確認しています: ${s3loc}"
+
+  # 既存オブジェクト件数を確認（Contents が無い場合は None）
+  local -a q_args=(s3api list-objects-v2 --bucket "$BUCKET")
+  [[ -n "$s3prefix" ]] && q_args+=(--prefix "$s3prefix")
+  q_args+=(--query 'length(Contents)' --output text)
+
+  local count
+  if ! count="$(aws_cli "${q_args[@]}")"; then
+    local kind; kind="$(classify_aws_error)"
+    case "$kind" in
+      EXPIRED|AUTH) die "$EXIT_AWS_AUTH" "認証情報の期限切れ等を検出しました。「${AUTH_HINT_COMMAND}」で再認証してください。" ;;
+      PERMISSION)   die "$EXIT_PERMISSION" "既存ファイル確認に必要な権限(s3:ListBucket)がありません: ${s3loc}" ;;
+      *)            die "$EXIT_BUCKET" "既存ファイルの一覧取得に失敗しました: ${AWS_CLI_LAST_STDERR}" ;;
+    esac
+  fi
+
+  if [[ -z "$count" || "$count" == "None" || "$count" == "0" ]]; then
+    log_info "アップロード先に既存ファイルはありません。バックアップは作成しません。"
+    return 0
+  fi
+
+  log_info "アップロード先に既存ファイルが ${count} 件あります。バックアップを作成します。"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log_info "dry-run のため実際のバックアップ作成は行いません。"
+    return 0
+  fi
+
+  # 既存ファイルをローカル一時ディレクトリへダウンロード
+  local tmpdir dl
+  tmpdir="$(make_temp_dir)"
+  dl="${tmpdir}/backup"
+  mkdir -p -- "$dl" || die "$EXIT_ZIP" "バックアップ用一時ディレクトリを作成できません: ${dl}"
+
+  log_info "既存ファイルをダウンロードしています: ${s3loc}"
+  if ! aws_cli s3 cp "$s3loc" "$dl" --recursive >/dev/null; then
+    local kind; kind="$(classify_aws_error)"
+    case "$kind" in
+      EXPIRED|AUTH) die "$EXIT_AWS_AUTH" "認証情報の期限切れ等を検出しました。「${AUTH_HINT_COMMAND}」で再認証してください。" ;;
+      PERMISSION)   die "$EXIT_PERMISSION" "既存ファイルのダウンロード権限(s3:GetObject)がありません: ${s3loc}" ;;
+      *)            die "$EXIT_ZIP" "既存ファイルのダウンロードに失敗しました: ${AWS_CLI_LAST_STDERR}" ;;
+    esac
+  fi
+
+  # ダウンロード結果が空でないことを確認
+  if [[ -z "$(find "$dl" -type f -print -quit 2>/dev/null)" ]]; then
+    log_warn "ダウンロードされたファイルがありませんでした。バックアップ ZIP は作成しません。"
+    return 0
+  fi
+
+  # 処理日時(YYYYMMDD_HHMMSS)付きのバックアップ ZIP を作成
+  local ts zipname zippath
+  ts="$(date '+%Y%m%d_%H%M%S')"
+  zipname="s3backup_${BUCKET}_${ts}.zip"
+  zippath="${BACKUP_DIR%/}/${zipname}"
+
+  log_info "バックアップ ZIP を作成しています: ${zippath}"
+  if ( cd "$dl" && zip -r -q -- "$zippath" . ); then
+    log_info "既存ファイルのバックアップを作成しました: ${zippath}"
+  else
+    die "$EXIT_ZIP" "バックアップ ZIP の作成に失敗しました: ${zippath}"
+  fi
 }
 
 # ==============================================================================
@@ -1321,6 +1488,7 @@ main() {
   # 5. 必須コマンド確認
   local -a req=(aws date stat find mktemp realpath basename dirname)
   if [[ "$ZIP_DIRECTORIES" == true ]]; then req+=(zip); fi
+  if [[ -n "$BACKUP_DIR" ]]; then req+=(zip mkdir); fi
   require_commands "${req[@]}"
 
   # 6. 引数整合性 + 正規化
@@ -1345,6 +1513,9 @@ main() {
 
   # 17. 計画表示
   show_plan
+
+  # 17.5. 既存ファイルのバックアップ（--backup-dir 指定時のみ）
+  backup_existing_s3_objects
 
   # 18-20. ZIP 作成 + 実アップロード + 検証
   local upload_rc=0
