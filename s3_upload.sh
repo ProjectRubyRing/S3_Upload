@@ -98,7 +98,17 @@ COUNT_SKIPPED=0
 # ==============================================================================
 # common.sh 読み込み
 #   --common-script 指定があればそれを、なければスクリプトと同ディレクトリの
-#   common.sh を探す。見つからない場合はフォールバック関数を定義する。
+#   common.sh を探して source する。
+#
+#   本スクリプトが利用する common.sh は、CodeCommit_Git_branch_local_Create プロジェクトの
+#   common.sh（汎用ユーティリティ: 色定義 / log_info・log_success・log_warn・log_error /
+#   die / run / confirm / require_command / aws_is_authenticated / aws_can_access_codecommit）
+#   である。本スクリプトが必要とするが、その common.sh には無い機能（ログレベル制御・
+#   aws_cli ラッパー・各種エスケープ・一時ファイル管理 等）は define_s3_common() で
+#   本スクリプト内に実装する（後述）。
+#
+#   このため common.sh が見つからない場合でも、define_s3_common() が必要な関数をすべて
+#   定義するので処理は継続できる。
 # ==============================================================================
 load_common() {
   local candidate="${COMMON_SCRIPT}"
@@ -122,9 +132,9 @@ load_common() {
     return 0
   fi
 
-  # common.sh が見つからない場合は最低限のフォールバックを使う
-  _fallback_warn "common.sh が見つからないため、内蔵の最小共通関数を使用します。"
-  _define_fallback_common
+  # common.sh が見つからない場合でも、必要な機能は define_s3_common() が定義するため続行可能。
+  _fallback_warn "common.sh が見つかりません。本スクリプト内蔵の共通関数のみで続行します。"
+  return 0
 }
 
 # common.sh 読み込み前でも使える最小 die/warn
@@ -137,48 +147,205 @@ _fallback_warn() {
   printf '%s [WARN] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
 }
 
-# common.sh が無い場合の内蔵フォールバック定義（機能は簡易版）
-_define_fallback_common() {
+# ==============================================================================
+# common.sh に無い機能の実装
+#   CodeCommit_Git_branch_local_Create の common.sh が提供しない、S3 アップロード処理に
+#   必要な共通関数を本スクリプト内で定義する。
+#
+#   なお die / log_info / log_warn / log_error は common.sh にも存在するが、本スクリプトは
+#   「ログレベル制御（DEBUG を含む・日時付き）」と「終了コードを第1引数に取る die（EXIT_* 規約）」
+#   を必要とするため、ここで上書き定義する。load_common() の後に本関数を呼び出すことで、
+#   common.sh の同名定義より本スクリプト側の定義を優先させる。
+# ==============================================================================
+define_s3_common() {
+  # ---- ログレベル定義（ERROR=1 < WARN=2 < INFO=3 < DEBUG=4）----
   declare -gA __LOG_LEVELS=([ERROR]=1 [WARN]=2 [INFO]=3 [DEBUG]=4)
-  __log_now() { date '+%Y-%m-%d %H:%M:%S'; }
+  : "${LOG_LEVEL:=INFO}"
+
+  __log_now()       { date '+%Y-%m-%d %H:%M:%S'; }
   __log_threshold() { echo "${__LOG_LEVELS[${LOG_LEVEL:-INFO}]:-3}"; }
-  __log_enabled() { [[ "${__LOG_LEVELS[$1]:-3}" -le "$(__log_threshold)" ]]; }
-  log() { local l="$1"; shift; __log_enabled "$l" || return 0
-    local ln; ln="$(__log_now) [${l}] $*"
-    if [[ "$l" == ERROR || "$l" == WARN ]]; then printf '%s\n' "$ln" >&2; else printf '%s\n' "$ln"; fi; }
-  log_error() { log ERROR "$@"; }; log_warn() { log WARN "$@"; }
-  log_info() { log INFO "$@"; }; log_debug() { log DEBUG "$@"; }
-  die() { local c="$1"; shift; log_error "$*"; exit "$c"; }
-  require_commands() { local m=() c; for c in "$@"; do command -v "$c" >/dev/null 2>&1 || m+=("$c"); done
-    [[ ${#m[@]} -eq 0 ]] || die "$EXIT_MISSING_COMMAND" "必須コマンドが見つかりません: ${m[*]}"; }
-  require_value() { [[ -n "$2" ]] || die "$EXIT_USAGE" "オプション $1 に値がありません。"; }
-  assert_readable_file() { [[ -f "$1" && -r "$1" ]] || die "$EXIT_LOCAL_FILE" "読み取り可能な通常ファイルではありません: $1"; }
-  assert_readable_dir() { [[ -d "$1" && -r "$1" && -x "$1" ]] || die "$EXIT_LOCAL_DIR" "読み取り可能なディレクトリではありません: $1"; }
-  assert_sourceable_file() { [[ -f "$1" && -r "$1" ]] || die "$EXIT_USAGE" "source 不可: $1"; }
+  __log_enabled()   { [[ "${__LOG_LEVELS[$1]:-3}" -le "$(__log_threshold)" ]]; }
+
+  # 汎用ログ関数: log LEVEL "メッセージ"
+  log() {
+    local level="$1"; shift
+    __log_enabled "$level" || return 0
+    local line; line="$(__log_now) [${level}] $*"
+    if [[ "$level" == "ERROR" || "$level" == "WARN" ]]; then
+      printf '%s\n' "$line" >&2
+    else
+      printf '%s\n' "$line"
+    fi
+  }
+  log_error() { log ERROR "$@"; }
+  log_warn()  { log WARN  "$@"; }
+  log_info()  { log INFO  "$@"; }
+  log_debug() { log DEBUG "$@"; }
+
+  # ---- 異常終了処理: die EXIT_CODE "メッセージ" ----
+  die() { local code="$1"; shift; log_error "$*"; exit "$code"; }
+
+  # ---- 必須コマンド存在確認（複数を一括確認）----
+  require_commands() {
+    local missing=() cmd
+    for cmd in "$@"; do
+      command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+      die "${EXIT_MISSING_COMMAND:-3}" "必須コマンドが見つかりません: ${missing[*]}"
+    fi
+    log_debug "必須コマンド確認 OK: $*"
+  }
+
+  # ---- 引数必須チェック ----
+  require_value() {
+    local name="$1" value="$2"
+    [[ -n "$value" ]] || die "${EXIT_USAGE:-2}" "オプション ${name} に値が指定されていません。"
+  }
+
+  # ---- ファイル/ディレクトリ確認 ----
+  assert_readable_file() {
+    local path="$1"
+    [[ -e "$path" ]] || die "${EXIT_LOCAL_FILE:-11}" "ファイルが存在しません: ${path}"
+    [[ -f "$path" ]] || die "${EXIT_LOCAL_FILE:-11}" "通常ファイルではありません: ${path}"
+    [[ -r "$path" ]] || die "${EXIT_LOCAL_FILE:-11}" "ファイルに読み取り権限がありません: ${path}"
+  }
+  assert_readable_dir() {
+    local path="$1"
+    [[ -e "$path" ]]            || die "${EXIT_LOCAL_DIR:-12}" "ディレクトリが存在しません: ${path}"
+    [[ -d "$path" ]]            || die "${EXIT_LOCAL_DIR:-12}" "ディレクトリではありません: ${path}"
+    [[ -r "$path" && -x "$path" ]] || die "${EXIT_LOCAL_DIR:-12}" "ディレクトリに読み取り/検索権限がありません: ${path}"
+  }
+  assert_sourceable_file() {
+    local path="$1"
+    [[ -n "$path" ]] || die "${EXIT_USAGE:-2}" "source 対象のパスが指定されていません。"
+    [[ -e "$path" ]] || die "${EXIT_USAGE:-2}" "source 対象ファイルが存在しません: ${path}"
+    [[ -f "$path" ]] || die "${EXIT_USAGE:-2}" "source 対象が通常ファイルではありません: ${path}"
+    [[ -r "$path" ]] || die "${EXIT_USAGE:-2}" "source 対象ファイルに読み取り権限がありません: ${path}"
+  }
+
+  # ---- 一時ファイル管理 ----
   declare -ga __TEMP_PATHS=()
   register_temp_path() { __TEMP_PATHS+=("$1"); }
   make_temp_file() { local t; t="$(mktemp "${TMPDIR:-/tmp}/s3upload.XXXXXX")"; register_temp_path "$t"; printf '%s' "$t"; }
-  make_temp_dir() { local t; t="$(mktemp -d "${TMPDIR:-/tmp}/s3upload.XXXXXX")"; register_temp_path "$t"; printf '%s' "$t"; }
-  cleanup_temp_files() { local p; for p in "${__TEMP_PATHS[@]:-}"; do [[ -n "$p" && -e "$p" ]] && rm -rf -- "$p" 2>/dev/null || true; done; __TEMP_PATHS=(); }
-  mask_sensitive() { sed -E 's/(secret_access_key|session_token|access_key_id)[[:space:]=:]+[^[:space:]]+/\1 ********/Ig'; }
+  make_temp_dir()  { local t; t="$(mktemp -d "${TMPDIR:-/tmp}/s3upload.XXXXXX")"; register_temp_path "$t"; printf '%s' "$t"; }
+  cleanup_temp_files() {
+    local p
+    for p in "${__TEMP_PATHS[@]:-}"; do
+      [[ -n "$p" ]] || continue
+      if [[ -e "$p" ]]; then
+        rm -rf -- "$p" 2>/dev/null || log_warn "一時パスの削除に失敗しました: ${p}"
+        log_debug "一時パスを削除しました: ${p}"
+      fi
+    done
+    __TEMP_PATHS=()
+  }
+
+  # ---- 機密値マスク（AWS CLI 表示用）----
+  mask_sensitive() {
+    sed -E \
+      -e 's/(aws_access_key_id[[:space:]=:]+)[A-Za-z0-9/+]+/\1********/Ig' \
+      -e 's/(aws_secret_access_key[[:space:]=:]+)[A-Za-z0-9/+]+/\1********/Ig' \
+      -e 's/(aws_session_token[[:space:]=:]+)[A-Za-z0-9/+=]+/\1********/Ig' \
+      -e 's/(--sse-kms-key-id[[:space:]=]+)[^[:space:]]+/\1********/Ig'
+  }
+
+  # ---- AWS CLI 実行ラッパー ----
+  #   AWS_PROFILE_OPT / AWS_REGION_OPT を注入し、stderr を AWS_CLI_LAST_STDERR に格納する。
   AWS_CLI_LAST_STDERR=""
-  aws_cli() { local -a a=(); [[ -n "${AWS_PROFILE_OPT:-}" ]] && a+=(--profile "$AWS_PROFILE_OPT")
-    [[ -n "${AWS_REGION_OPT:-}" ]] && a+=(--region "$AWS_REGION_OPT"); a+=("$@")
-    local ef o rc; ef="$(mktemp "${TMPDIR:-/tmp}/s3upload.awserr.XXXXXX")"
-    set +e; o="$(AWS_PAGER="" aws "${a[@]}" 2>"$ef")"; rc=$?; set -e
-    AWS_CLI_LAST_STDERR="$(cat "$ef" 2>/dev/null || true)"; rm -f -- "$ef" 2>/dev/null || true
-    printf '%s' "$o"; return $rc; }
-  classify_aws_error() { local m="${AWS_CLI_LAST_STDERR:-}"
-    if grep -qiE 'ExpiredToken|InvalidClientTokenId|expired' <<<"$m"; then echo EXPIRED
-    elif grep -qiE 'AccessDenied|UnauthorizedOperation|not authorized|Forbidden' <<<"$m"; then echo PERMISSION
-    elif grep -qiE 'Unable to locate credentials|NoCredentials|SignatureDoesNotMatch|AuthFailure' <<<"$m"; then echo AUTH
-    else echo OTHER; fi; }
-  aws_get_caller_account() { local ac; if ac="$(aws_cli sts get-caller-identity --query Account --output text)"; then
-    [[ "$ac" =~ ^[0-9]{12}$ ]] && { printf '%s' "$ac"; return 0; }; fi; return 1; }
-  validate_switchback_script() { assert_sourceable_file "$1"; }
-  csv_escape() { local f="$1"; if [[ "$f" == *[,\"$'\n']* ]]; then f="${f//\"/\"\"}"; printf '"%s"' "$f"; else printf '%s' "$f"; fi; }
-  tsv_escape() { local f="$1"; f="${f//$'\t'/ }"; f="${f//$'\n'/ }"; printf '%s' "$f"; }
-  json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"; printf '%s' "$s"; }
+  aws_cli() {
+    local -a args=()
+    [[ -n "${AWS_PROFILE_OPT:-}" ]] && args+=(--profile "${AWS_PROFILE_OPT}")
+    [[ -n "${AWS_REGION_OPT:-}" ]]  && args+=(--region "${AWS_REGION_OPT}")
+    args+=("$@")
+
+    if __log_enabled DEBUG; then
+      local shown; shown="$(printf 'aws %s' "${args[*]}" | mask_sensitive)"
+      log_debug "AWS CLI 実行: ${shown}"
+    fi
+
+    local stderr_file rc stdout
+    stderr_file="$(mktemp "${TMPDIR:-/tmp}/s3upload.awserr.XXXXXX")"
+    set +e
+    stdout="$(AWS_PAGER="" aws "${args[@]}" 2>"$stderr_file")"
+    rc=$?
+    set -e
+    AWS_CLI_LAST_STDERR="$(cat "$stderr_file" 2>/dev/null || true)"
+    rm -f -- "$stderr_file" 2>/dev/null || true
+    printf '%s' "$stdout"
+    return "$rc"
+  }
+
+  # ---- AWS エラー分類（AUTH / PERMISSION / EXPIRED / NETWORK / OTHER）----
+  classify_aws_error() {
+    local msg="${AWS_CLI_LAST_STDERR:-}"
+    if grep -qiE 'ExpiredToken|token.*expired|InvalidClientTokenId|credentials.*expired' <<<"$msg"; then
+      echo "EXPIRED"
+    elif grep -qiE 'AccessDenied|UnauthorizedOperation|not authorized|AccessDeniedException|Forbidden' <<<"$msg"; then
+      echo "PERMISSION"
+    elif grep -qiE 'Unable to locate credentials|NoCredentialsError|Unable to parse|SignatureDoesNotMatch|AuthFailure' <<<"$msg"; then
+      echo "AUTH"
+    elif grep -qiE 'Could not connect|Connection.*refused|EndpointConnectionError|timed out|Network' <<<"$msg"; then
+      echo "NETWORK"
+    else
+      echo "OTHER"
+    fi
+  }
+
+  # ---- 認証済みアカウントID取得（成功時 12桁を標準出力へ）----
+  aws_get_caller_account() {
+    local acct
+    if acct="$(aws_cli sts get-caller-identity --query 'Account' --output text)"; then
+      if [[ "$acct" =~ ^[0-9]{12}$ ]]; then
+        printf '%s' "$acct"; return 0
+      fi
+      AWS_CLI_LAST_STDERR="想定外のアカウントID応答: ${acct}"
+      return 1
+    fi
+    return 1
+  }
+
+  # ---- スイッチバックスクリプト検証（source 前の安全性確認）----
+  validate_switchback_script() {
+    local path="$1"
+    assert_sourceable_file "$path"
+    local perm owner
+    if perm="$(stat -c '%a' "$path" 2>/dev/null)"; then
+      # 末尾桁（other 権限）が 2/3/6/7 = 他者書き込み可能
+      local other="${perm: -1}"
+      case "$other" in
+        2|3|6|7)
+          die "${EXIT_SWITCHBACK:-30}" "スイッチバックスクリプトが他者書き込み可能です（危険）: ${path} (perm=${perm})"
+          ;;
+      esac
+    fi
+    if owner="$(stat -c '%U' "$path" 2>/dev/null)"; then
+      log_debug "スイッチバックスクリプト所有者: ${owner}, パーミッション: ${perm:-unknown}"
+    fi
+    return 0
+  }
+
+  # ---- CSV / TSV / JSON エスケープ ----
+  csv_escape() {
+    local field="$1"
+    if [[ "$field" == *[,\"$'\n'$'\r']* ]]; then
+      field="${field//\"/\"\"}"
+      printf '"%s"' "$field"
+    else
+      printf '%s' "$field"
+    fi
+  }
+  tsv_escape() {
+    local field="$1"
+    field="${field//$'\t'/ }"; field="${field//$'\n'/ }"; field="${field//$'\r'/ }"
+    printf '%s' "$field"
+  }
+  json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+  }
 }
 
 # ==============================================================================
@@ -1144,7 +1311,12 @@ main() {
   parse_args "$@"
 
   # 4. 共通スクリプト読み込み（3.--help は parse_args 内で処理済み）
+  #    common.sh（CodeCommit_Git_branch_local_Create のもの）を source した後、
+  #    その common.sh に無い機能を define_s3_common() で定義する。
+  #    define_s3_common() は load_common() の後に呼ぶことで、common.sh の同名関数
+  #    （die / log_* 等）を S3 スクリプトの規約に合わせて上書きする。
   load_common
+  define_s3_common
 
   # 5. 必須コマンド確認
   local -a req=(aws date stat find mktemp realpath basename dirname)
