@@ -17,12 +17,35 @@ DEFAULT_REGION="ap-northeast-1"
 DEFAULT_BUCKET="example-bucket"
 DEFAULT_PREFIX="incoming"
 
+# アップロード先に既存ファイルがある場合のバックアップ ZIP 出力先ディレクトリ。
+# 空なら無効（--backup-dir を渡さない）。実行時 --backup-dir / --no-backup で上書き可。
+DEFAULT_BACKUP_DIR="/var/backup/s3_upload"
+
 DEFAULT_SWITCHBACK_MODE="auto"
 DEFAULT_SWITCHBACK_SCRIPT="/opt/company/aws/switchback.sh"
 DEFAULT_SWITCHBACK_ARGS=("arn:aws:iam::123456789012:role/UploadRole")
 
 DEFAULT_LOG_LEVEL="INFO"
 DEFAULT_RESULT_FORMAT="csv"
+
+# 結果ファイル名に処理日時(YYYYMMDD_HHMMSS)を付与するか（true/false）。
+# 例: result.csv → result_20260101_120000.csv
+DEFAULT_RESULT_TIMESTAMP=true
+
+# 既存オブジェクトの上書きを既定で許可するか（true/false）。
+# true にした場合でも、実行時に --no-allow-overwrite で打ち消せる。
+DEFAULT_ALLOW_OVERWRITE=false
+
+# その他のフラグ既定値（true にすると実行時 --no-... で打ち消せる）
+# DEFAULT_ZIP=false
+# DEFAULT_DRY_RUN=false
+# DEFAULT_CONTINUE_ON_ERROR=false
+# DEFAULT_VERIFY_UPLOAD=false
+
+# オブジェクト属性（空なら渡さない）
+# DEFAULT_STORAGE_CLASS="STANDARD_IA"
+# DEFAULT_SSE="aws:kms"
+# DEFAULT_KMS_KEY_ID="arn:aws:kms:ap-northeast-1:123456789012:key/xxxx"
 
 # 毎回必ず指定させたい項目は、既定値を空にして REQUIRED_VARS に列挙する。
 # 例: バケットを毎回指定させたい場合
