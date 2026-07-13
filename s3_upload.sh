@@ -1144,7 +1144,9 @@ create_zip_for_dir() {
   base="$(basename -- "$dir")"
 
   # 親ディレクトリ名を含めるため、親へ cd して base を対象にする（サブシェルで実行）
-  if ( cd "$parent" && zip -r -q -- "$zippath" "$base" ); then
+  # zip はアーカイブ名の前に "--" を置けない（Invalid command arguments になる）ため、
+  # "-" 始まりの名前は "./" 前置で保護する（zip は格納時に "./" を取り除く）
+  if ( cd "$parent" && zip -r -q "$zippath" "./$base" ); then
     printf '%s' "$zippath"
     return 0
   fi
@@ -1221,10 +1223,16 @@ backup_existing_s3_objects() {
   local ts zipname zippath
   ts="$(date '+%Y%m%d_%H%M%S')"
   zipname="s3backup_${BUCKET}_${ts}.zip"
-  zippath="${BACKUP_DIR%/}/${zipname}"
+  # zip 実行前に一時ディレクトリへ cd するため、--backup-dir が相対パスでも
+  # 正しい場所へ出力されるよう絶対パスに解決する
+  local backup_dir_abs
+  backup_dir_abs="$(cd "$BACKUP_DIR" && pwd)" \
+    || die "$EXIT_ZIP" "バックアップ出力先ディレクトリへ移動できません: ${BACKUP_DIR}"
+  zippath="${backup_dir_abs%/}/${zipname}"
 
   log_info "バックアップ ZIP を作成しています: ${zippath}"
-  if ( cd "$dl" && zip -r -q -- "$zippath" . ); then
+  # zip はアーカイブ名の前に "--" を置けない（Invalid command arguments になる）
+  if ( cd "$dl" && zip -r -q "$zippath" . ); then
     log_info "既存ファイルのバックアップを作成しました: ${zippath}"
   else
     die "$EXIT_ZIP" "バックアップ ZIP の作成に失敗しました: ${zippath}"
